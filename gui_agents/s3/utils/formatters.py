@@ -1,9 +1,11 @@
 """This file contains various formatting checks used to reprompt an agent for correctly formatted responses."""
 
+import ast
+import inspect
+
 from gui_agents.s3.utils.common_utils import (
     extract_agent_functions,
     parse_code_from_string,
-    create_pyautogui_code,
     split_thinking_response,
 )
 
@@ -19,19 +21,41 @@ SINGLE_ACTION_FORMATTER = lambda response: (
 )
 
 
-def _attempt_code_creation(agent, code, obs):
-    """Attempts to create a pyautogui code snippet from the response code"""
+def _validate_agent_action(agent, code):
+    """Validate a proposed agent action without executing side effects."""
+    if not code.strip():
+        return False
+
     try:
-        return create_pyautogui_code(agent, code, obs)
-    except Exception as e:
-        return None
+        parsed = ast.parse(code.strip(), mode="eval")
+        call = parsed.body
+        if not isinstance(call, ast.Call):
+            return False
+
+        func = call.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "agent"
+        ):
+            return False
+
+        method = getattr(agent, func.attr, None)
+        if method is None:
+            return False
+
+        args = [ast.literal_eval(arg) for arg in call.args]
+        kwargs = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
+        inspect.signature(method).bind(*args, **kwargs)
+        return True
+    except Exception:
+        return False
 
 
 code_valid_check = (
-    lambda agent, obs, response: _attempt_code_creation(
-        agent, parse_code_from_string(response), obs
+    lambda agent, obs, response: _validate_agent_action(
+        agent, parse_code_from_string(response)
     )
-    is not None
 )
 code_valid_error_msg = "Incorrect code: The agent action must be a valid function and use valid parameters from the docstring list."
 CODE_VALID_FORMATTER = lambda agent, obs, response: (

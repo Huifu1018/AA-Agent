@@ -32,11 +32,16 @@ class PROCEDURAL_MEMORY:
         Use code agent for:
         - **ALL spreadsheet calculations**: sums, totals, averages, formulas, data filling, missing value calculations
         - **ALL data manipulation tasks**: including calculations, data processing (filtering, sorting, replacing, cleanup), bulk operations (filling or transforming ranges), formatting changes (number/date/currency formats, styles), and large-scale data entry or editing
+        - **Local file operations**: copying files, renaming files, moving files, and path-based file handling
+        - **Finder path reveal**: locating a known file or folder path directly in Finder when the user explicitly wants to see it there
 
         **Usage Strategy**:
         - **Full Task**: Use `agent.call_code_agent()` when the task involves ANY data manipulation, calculations, or bulk operations
         - **Subtask**: Use `agent.call_code_agent("specific subtask")` for focused data tasks
         - **CRITICAL**: If calling the code agent for the full task, pass the original task instruction without rewording or modification
+        - **Hybrid tasks**: If a task combines local file preparation with later GUI work (for example, create a file in a known folder and then send it in WeChat), use the code agent FIRST to prepare the file at the exact requested path, then continue with GUI actions for the remaining app workflow
+        - **Known paths**: If the instruction already gives an explicit file or folder path, do not waste GUI steps navigating Finder before the file exists; prepare or verify the file through the code agent first
+        - **Finder reveal tasks**: If the instruction gives an explicit path and asks to find, show, reveal, open, or locate it in Finder, prefer the code agent first so Finder opens directly to the requested item
 
         ### Code Agent Result Interpretation
         - The code agent runs Python/Bash code in the background (up to 20 steps), independently performing tasks like file modification, package installation, or system operations.
@@ -59,6 +64,14 @@ class PROCEDURAL_MEMORY:
         # General Task Guidelines
         - For formatting tasks, always use the code agent for proper formatting.
         - **Never use the code agent for charts, graphs, pivot tables, or visual elements—always use the GUI for those.**
+        - **WeChat file sending**: When sending non-text files in WeChat (documents, txt, pdf, word files, images, etc.), first switch into the correct chat, then click WeChat's attachment/file button, use the system file picker to choose the file, click Open, confirm the recipient is correct, and then send it.
+        - **Never rely on clipboard paste for non-text file sending in WeChat** unless the user explicitly asks for that exact behavior.
+        - **Before clicking the attachment button in WeChat, verify the top chat title matches the requested conversation** so the file is not sent to the wrong chat.
+        - **WeChat contact search**: When the task is to message a person in WeChat, treat the goal as entering the chat window directly. In search results, prefer the exact contact-name match under 联系人/Contacts, and prefer opening it in a way that enters the chat immediately instead of wandering into a profile card.
+        - **WeChat profile-card fallback**: If a contact profile card appears, use the explicit 发消息/Send Message control once. If it still does not enter the chat, close the card and return to the exact search result instead of repeatedly clicking around inside the profile card.
+        - **Outlook/latest-email extraction**: If the user asks for the latest content from an email thread, capture only the newest email body and exclude quoted history, earlier thread replies, signatures, and forwarded context unless the user explicitly asks for the full thread.
+        - **Existing file targets**: If the task names an existing file or gives an explicit target path, open and overwrite that existing file instead of creating a new document unless the user explicitly requests a new file.
+        - **Text-file targets**: If the target is a txt/text file, treat it as a plain text file to edit and save in place. Do not create a new Word document unless the user explicitly asks for a Word file.
         - If creating a new sheet with no name specified, use default sheet names (e.g., "Sheet1", "Sheet2", etc.).
         - After opening or reopening applications, wait at least 3 seconds for full loading.
         - Don't provide specific row/column numbers to the coding agent; let it infer the spreadsheet structure itself.
@@ -218,6 +231,14 @@ class PROCEDURAL_MEMORY:
     # CRITICAL: Code-Based Task Solving
     - You are responsible for writing EXECUTABLE CODE to solve the task programmatically
     - Write Python/Bash scripts that process, filter, transform, or manipulate the data as required
+    - For local file operations in Python, you have helper functions available automatically:
+        * `copy_file(src, dst)` copies one file and returns the destination path
+        * `rename_file(src, dst)` renames/moves one file and returns the destination path
+        * `move_file(src, dst)` moves one file and returns the destination path
+        * `reveal_in_finder(path)` opens Finder directly to the provided file or folder path on macOS
+    - Prefer these helper functions over handwritten shell commands for simple file copy/rename tasks
+    - If the user provides an explicit local path for a file creation or editing task, prefer direct Python file operations at that path instead of trying to create the file through Finder UI
+    - If the user provides an explicit local path and asks to locate it in Finder, prefer `reveal_in_finder(path)` over manually navigating Finder
 
     # CRITICAL: Preserve Document Structure and Formatting
     - When modifying documents/spreadsheets, PRESERVE the original structure, headers, and formatting

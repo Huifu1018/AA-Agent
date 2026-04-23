@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import platform
+import shlex
 import pyautogui
 import signal
 import sys
@@ -130,6 +131,53 @@ logger.addHandler(sdebug_handler)
 platform_os = platform.system()
 
 
+def _first_env(*names):
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return ""
+
+
+def _apply_kimi_defaults(args):
+    default_openai_model = "gpt-5-2025-08-07"
+
+    if args.provider == "kimi":
+        if not args.model or args.model == default_openai_model:
+            args.model = _first_env(
+                "KIMI_MODEL",
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            ) or "kimi-k2.5"
+        if not args.model_api_key:
+            args.model_api_key = _first_env("KIMI_API_KEY", "ANTHROPIC_API_KEY")
+        if not args.model_url:
+            args.model_url = _first_env("KIMI_BASE_URL", "ANTHROPIC_BASE_URL")
+
+    if args.ground_provider == "kimi":
+        if not args.ground_model:
+            args.ground_model = _first_env(
+                "KIMI_GROUND_MODEL",
+                "KIMI_MODEL",
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            ) or "kimi-k2.5"
+        if not args.ground_api_key:
+            args.ground_api_key = _first_env(
+                "KIMI_GROUND_API_KEY",
+                "KIMI_API_KEY",
+                "ANTHROPIC_API_KEY",
+            )
+        if not args.ground_url:
+            args.ground_url = _first_env(
+                "KIMI_GROUND_BASE_URL",
+                "KIMI_BASE_URL",
+                "ANTHROPIC_BASE_URL",
+            )
+
+    return args
+
+
 def show_permission_dialog(code: str, action_description: str):
     """Show a platform-specific permission dialog and return True if approved."""
     if platform.system() == "Darwin":
@@ -152,15 +200,116 @@ def scale_screen_dimensions(width: int, height: int, max_dim_size: int):
     return safe_width, safe_height
 
 
+def _truncate_text(text: str, max_len: int = 700) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
+def _escape_applescript(text: str) -> str:
+    return (
+        text.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
+
+
+def show_status_dialog(title: str, message: str):
+    safe_title = _escape_applescript(title)
+    safe_message = _escape_applescript(_truncate_text(message, 1600))
+    if platform.system() == "Darwin":
+        os.system(
+            f'osascript -e \'display dialog "{safe_message}" with title "{safe_title}" buttons {{"OK"}} default button "OK"\''
+        )
+    elif platform.system() == "Linux":
+        os.system(
+            f'zenity --info --title={shlex.quote(title)} --text={shlex.quote(message)} --width=420 --height=240'
+        )
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    minutes, secs = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} 小时 {minutes} 分 {secs} 秒"
+    if minutes:
+        return f"{minutes} 分 {secs} 秒"
+    return f"{secs} 秒"
+
+
+def build_task_feedback(
+    status: str,
+    reason: str,
+    steps_completed: int,
+    max_steps: int,
+    last_info: dict | None,
+    last_code: str | None,
+    duration_seconds: float | None = None,
+):
+    headline = {
+        "completed": "AA-CUA 已完成任务。",
+        "failed": "AA-CUA 未完成任务。",
+        "incomplete": "AA-CUA 未在步数上限内完成任务。",
+    }.get(status, "AA-CUA 任务已结束。")
+
+    last_action = ""
+    if last_info:
+        last_action = (
+            last_info.get("plan_code")
+            or last_info.get("exec_code")
+            or last_code
+            or ""
+        )
+
+    code_agent_output = last_info.get("code_agent_output") if last_info else None
+    code_agent_summary = ""
+    if code_agent_output:
+        code_agent_summary = code_agent_output.get("summary", "")
+
+    plan_summary = last_info.get("plan", "") if last_info else ""
+
+    lines = [
+        headline,
+        f"已执行步数: {steps_completed}/{max_steps}",
+        f"结束原因: {reason}",
+    ]
+    if duration_seconds is not None:
+        lines.insert(2, f"任务耗时: {_format_duration(duration_seconds)}")
+    if last_action:
+        lines.append(f"最后一步动作: {_truncate_text(last_action, 240)}")
+    if code_agent_summary:
+        lines.append(f"代码代理摘要: {_truncate_text(code_agent_summary, 320)}")
+    elif plan_summary:
+        lines.append(f"最后计划摘要: {_truncate_text(plan_summary, 320)}")
+
+    message = "\n".join(lines)
+    logger.info("AGENT_S_FINAL_STATUS: %s", status)
+    logger.info("AGENT_S_FINAL_REASON: %s", reason)
+    logger.info("AGENT_S_FINAL_SUMMARY: %s", message.replace("\n", " | "))
+    return message
+
+
 def run_agent(agent, instruction: str, scaled_width: int, scaled_height: int):
     global paused
+    started_at = time.time()
     obs = {}
     traj = "Task:\n" + instruction
     subtask_traj = ""
-    for step in range(15):
+    max_steps = int(os.getenv("AGENT_S_MAX_STEPS", "25"))
+    last_info = None
+    last_code = None
+    final_status = "incomplete"
+    final_reason = "Reached the maximum step budget without an explicit completion signal."
+    steps_completed = 0
+
+    for step in range(max_steps):
         # Check if we're in paused state and wait
         while paused:
             time.sleep(0.1)
+        print(f"\n🔄 Step {step + 1}/{max_steps}: Capturing screen and preparing next action...")
         # Get screen shot using pyautogui
         screenshot = pyautogui.screenshot()
         screenshot = screenshot.resize((scaled_width, scaled_height), Image.LANCZOS)
@@ -178,21 +327,27 @@ def run_agent(agent, instruction: str, scaled_width: int, scaled_height: int):
         while paused:
             time.sleep(0.1)
 
-        print(f"\n🔄 Step {step + 1}/15: Getting next action from agent...")
+        print(f"🤖 Step {step + 1}/{max_steps}: Getting next action from agent...")
 
         # Get next action code from the agent
-        info, code = agent.predict(instruction=instruction, observation=obs)
+        try:
+            info, code = agent.predict(instruction=instruction, observation=obs)
+        except Exception as exc:
+            final_status = "failed"
+            final_reason = f"Agent planning failed with: {exc}"
+            logger.exception("AGENT_S_PREDICTION_FAILED")
+            break
+        last_info = info
+        last_code = code[0] if code else ""
+        steps_completed = step + 1
 
         if "done" in code[0].lower() or "fail" in code[0].lower():
-            if platform.system() == "Darwin":
-                os.system(
-                    f'osascript -e \'display dialog "Task Completed" with title "OpenACI Agent" buttons "OK" default button "OK"\''
-                )
-            elif platform.system() == "Linux":
-                os.system(
-                    f'zenity --info --title="OpenACI Agent" --text="Task Completed" --width=200 --height=100'
-                )
-
+            final_status = "completed" if "done" in code[0].lower() else "failed"
+            final_reason = (
+                "The agent emitted agent.done()."
+                if final_status == "completed"
+                else "The agent emitted agent.fail()."
+            )
             break
 
         if "next" in code[0].lower():
@@ -212,7 +367,13 @@ def run_agent(agent, instruction: str, scaled_width: int, scaled_height: int):
                 time.sleep(0.1)
 
             # Ask for permission before executing
-            exec(code[0])
+            try:
+                exec(code[0])
+            except Exception as exc:
+                final_status = "failed"
+                final_reason = f"Action execution failed with: {exc}"
+                logger.exception("AGENT_S_ACTION_EXECUTION_FAILED")
+                break
             time.sleep(1.0)
 
             # Update task and subtask trajectories
@@ -224,6 +385,30 @@ def run_agent(agent, instruction: str, scaled_width: int, scaled_height: int):
                     + info["executor_plan"]
                 )
 
+    duration_seconds = time.time() - started_at
+
+    feedback = build_task_feedback(
+        status=final_status,
+        reason=final_reason,
+        steps_completed=steps_completed,
+        max_steps=max_steps,
+        last_info=last_info,
+        last_code=last_code,
+        duration_seconds=duration_seconds,
+    )
+    dialog_title = (
+        "AA-CUA 任务完成" if final_status == "completed" else "AA-CUA 任务未完成"
+    )
+    show_status_dialog(dialog_title, feedback)
+    return {
+        "status": final_status,
+        "reason": final_reason,
+        "steps_completed": steps_completed,
+        "max_steps": max_steps,
+        "duration_seconds": duration_seconds,
+        "summary": feedback,
+    }
+
 
 def main():
     parser = argparse.ArgumentParser(description="Run AgentS3 with specified model.")
@@ -231,7 +416,7 @@ def main():
         "--provider",
         type=str,
         default="openai",
-        help="Specify the provider to use (e.g., openai, anthropic, etc.)",
+        help="Specify the provider to use (e.g., openai, anthropic, kimi, etc.)",
     )
     parser.add_argument(
         "--model",
@@ -268,7 +453,7 @@ def main():
     parser.add_argument(
         "--ground_url",
         type=str,
-        required=True,
+        default="",
         help="The URL of the grounding model",
     )
     parser.add_argument(
@@ -280,7 +465,7 @@ def main():
     parser.add_argument(
         "--ground_model",
         type=str,
-        required=True,
+        default="",
         help="The model name for the grounding model",
     )
     parser.add_argument(
@@ -306,8 +491,14 @@ def main():
     parser.add_argument(
         "--enable_reflection",
         action="store_true",
-        default=True,
+        default=None,
         help="Enable reflection agent to assist the worker agent",
+    )
+    parser.add_argument(
+        "--disable_reflection",
+        action="store_false",
+        dest="enable_reflection",
+        help="Disable reflection agent for faster execution",
     )
     parser.add_argument(
         "--enable_local_env",
@@ -321,7 +512,22 @@ def main():
         help="The task instruction for Agent-S3 to perform.",
     )
 
-    args = parser.parse_args()
+    args = _apply_kimi_defaults(parser.parse_args())
+
+    if args.enable_reflection is None:
+        args.enable_reflection = os.getenv("AGENT_S_ENABLE_REFLECTION", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    if not args.model:
+        parser.error("--model is required")
+    if not args.ground_model:
+        parser.error("--ground_model is required")
+    if args.ground_provider != "kimi" and not args.ground_url:
+        parser.error("--ground_url is required unless --ground_provider kimi can resolve it from env")
 
     # Re-scales screenshot size to ensure it fits in UI-TARS context limit
     screen_width, screen_height = pyautogui.size()
@@ -378,7 +584,9 @@ def main():
     # handle query from command line
     if isinstance(task, str) and task.strip():
         agent.reset()
-        run_agent(agent, task, scaled_width, scaled_height)
+        result = run_agent(agent, task, scaled_width, scaled_height)
+        if result.get("status") != "completed":
+            sys.exit(1)
         return
 
     while True:
@@ -387,7 +595,7 @@ def main():
         agent.reset()
 
         # Run the agent on your own device
-        run_agent(agent, query, scaled_width, scaled_height)
+        result = run_agent(agent, query, scaled_width, scaled_height)
 
         response = input("Would you like to provide another query? (y/n): ")
         if response.lower() != "y":

@@ -39,6 +39,7 @@ def call_llm_safe(
     max_retries = 3  # Set the maximum number of retries
     attempt = 0
     response = ""
+    last_error = None
     while attempt < max_retries:
         try:
             response = agent.get_response(
@@ -48,11 +49,15 @@ def call_llm_safe(
             print("Response success!")
             break  # If successful, break out of the loop
         except Exception as e:
+            last_error = e
             attempt += 1
+            logger.warning("LLM call failed on attempt %s/%s: %s", attempt, max_retries, e)
             print(f"Attempt {attempt} failed: {e}")
             if attempt == max_retries:
                 print("Max retries reached. Handling failure.")
         time.sleep(1.0)
+    if last_error is not None and not response:
+        raise RuntimeError(f"LLM request failed after {max_retries} attempts: {last_error}")
     return response if response is not None else ""
 
 

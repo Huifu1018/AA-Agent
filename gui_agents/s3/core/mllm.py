@@ -6,6 +6,7 @@ from gui_agents.s3.core.engine import (
     LMMEngineAnthropic,
     LMMEngineAzureOpenAI,
     LMMEngineHuggingFace,
+    LMMEngineKimi,
     LMMEngineOpenAI,
     LMMEngineOpenRouter,
     LMMEngineParasail,
@@ -23,6 +24,8 @@ class LMMAgent:
                     self.engine = LMMEngineOpenAI(**engine_params)
                 elif engine_type == "anthropic":
                     self.engine = LMMEngineAnthropic(**engine_params)
+                elif engine_type == "kimi":
+                    self.engine = LMMEngineKimi(**engine_params)
                 elif engine_type == "azure":
                     self.engine = LMMEngineAzureOpenAI(**engine_params)
                 elif engine_type == "vllm":

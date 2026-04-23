@@ -20,6 +20,13 @@ class ACI:
     def __init__(self):
         self.notes: List[str] = []
 
+    @staticmethod
+    def _normalize_task_text(task: Optional[str]) -> str:
+        """Normalize task text so equivalent full-task calls are treated consistently."""
+        if not task:
+            return ""
+        return " ".join(task.strip().split()).casefold()
+
 
 # Agent action decorator
 def agent_action(func):
@@ -224,6 +231,26 @@ class OSWorldACI(ACI):
         # Store task instruction for code agent
         self.current_task_instruction = None
         self.last_code_agent_result = None
+        self.last_code_agent_was_full_task = False
+
+    def _parse_grounding_response(self, response: str) -> List[int]:
+        grounding_width = self.engine_params_for_grounding["grounding_width"]
+        grounding_height = self.engine_params_for_grounding["grounding_height"]
+
+        # Prefer decimal-aware parsing so models can return "(0.825, 0.017)".
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", response)
+        if len(numbers) < 2:
+            raise ValueError(f"Unable to parse coordinates from response: {response}")
+
+        x = float(numbers[0])
+        y = float(numbers[1])
+
+        # Some multimodal models return normalized coordinates in [0, 1].
+        if 0 <= x <= 1 and 0 <= y <= 1:
+            x *= grounding_width
+            y *= grounding_height
+
+        return [round(x), round(y)]
 
     # Given the state and worker's referring expression, use the grounding model to generate (x,y)
     def generate_coords(self, ref_expr: str, obs: Dict) -> List[int]:
@@ -240,9 +267,7 @@ class OSWorldACI(ACI):
         # Generate and parse coordinates
         response = call_llm_safe(self.grounding_model)
         print("RAW GROUNDING MODEL RESPONSE:", response)
-        numericals = re.findall(r"\d+", response)
-        assert len(numericals) >= 2
-        return [int(numericals[0]), int(numericals[1])]
+        return self._parse_grounding_response(response)
 
     # Calls pytesseract to generate word level bounding boxes for text grounding
     def get_ocr_elements(self, b64_image_data: str) -> Tuple[str, List]:
@@ -377,7 +402,22 @@ class OSWorldACI(ACI):
             app_code:str the code name of the application to switch to from the provided list of open applications
         """
         if self.platform == "darwin":
-            return f"import pyautogui; import time; pyautogui.hotkey('command', 'space', interval=0.5); pyautogui.typewrite({repr(app_code)}); pyautogui.press('enter'); time.sleep(1.0)"
+            return (
+                "import subprocess; import time; "
+                f"app_name = {repr(app_code)}; "
+                "bundle_map = {'WeChat': 'com.tencent.xinWeChat', '微信': 'com.tencent.xinWeChat'}; "
+                "bundle_id = bundle_map.get(app_name); "
+                "activated = False; "
+                "\nif bundle_id:\n"
+                "    result = subprocess.run(['osascript', '-e', f'tell application id \"{bundle_id}\" to activate'], capture_output=True, text=True)\n"
+                "    activated = result.returncode == 0\n"
+                "if not activated:\n"
+                "    result = subprocess.run(['open', '-a', app_name], capture_output=True, text=True)\n"
+                "    activated = result.returncode == 0\n"
+                "if not activated:\n"
+                "    raise RuntimeError(f'Unable to open or activate application: {app_name}')\n"
+                "time.sleep(0.6)"
+            )
         elif self.platform == "linux":
             return UBUNTU_APP_SETUP.replace("APP_NAME", app_code)
         elif self.platform == "windows":
@@ -396,7 +436,27 @@ class OSWorldACI(ACI):
         if self.platform == "linux":
             return f"import pyautogui; pyautogui.hotkey('win'); time.sleep(0.5); pyautogui.write({repr(app_or_filename)}); time.sleep(1.0); pyautogui.hotkey('enter'); time.sleep(0.5)"
         elif self.platform == "darwin":
-            return f"import pyautogui; import time; pyautogui.hotkey('command', 'space', interval=0.5); pyautogui.typewrite({repr(app_or_filename)}); pyautogui.press('enter'); time.sleep(1.0)"
+            return (
+                "import pathlib; import subprocess; import time; "
+                f"target = {repr(app_or_filename)}; "
+                "bundle_map = {'WeChat': 'com.tencent.xinWeChat', '微信': 'com.tencent.xinWeChat'}; "
+                "path = pathlib.Path(target).expanduser(); "
+                "opened = False; "
+                "\nif path.exists():\n"
+                "    result = subprocess.run(['open', str(path)], capture_output=True, text=True)\n"
+                "    opened = result.returncode == 0\n"
+                "else:\n"
+                "    bundle_id = bundle_map.get(target)\n"
+                "    if bundle_id:\n"
+                "        result = subprocess.run(['osascript', '-e', f'tell application id \"{bundle_id}\" to activate'], capture_output=True, text=True)\n"
+                "        opened = result.returncode == 0\n"
+                "    if not opened:\n"
+                "        result = subprocess.run(['open', '-a', target], capture_output=True, text=True)\n"
+                "        opened = result.returncode == 0\n"
+                "if not opened:\n"
+                "    raise RuntimeError(f'Unable to open target: {target}')\n"
+                "time.sleep(0.6)"
+            )
         elif self.platform == "windows":
             return (
                 "import pyautogui; import time; "
@@ -563,15 +623,24 @@ class OSWorldACI(ACI):
         logger.info("GROUNDING AGENT: Calling Code Agent")
         logger.info("=" * 50)
 
-        # **CRITICAL**: Only use provided task for specific subtasks, otherwise use original task instruction
-        if task is not None:
-            # This is a subtask - use the provided task
-            task_to_execute = task
-            logger.info(f"Executing SUBTASK: {task_to_execute}")
-        else:
-            # This is a full task - use the original task instruction to prevent hallucination
+        normalized_requested_task = self._normalize_task_text(task)
+        normalized_current_task = self._normalize_task_text(
+            self.current_task_instruction
+        )
+        is_full_task = (
+            task is None
+            or normalized_requested_task == normalized_current_task
+        )
+
+        # Treat explicit full-task strings the same as an omitted task parameter.
+        if is_full_task:
             task_to_execute = self.current_task_instruction
+            self.last_code_agent_was_full_task = True
             logger.info(f"Executing FULL TASK: {task_to_execute}")
+        else:
+            task_to_execute = task
+            self.last_code_agent_was_full_task = False
+            logger.info(f"Executing SUBTASK: {task_to_execute}")
 
         if task_to_execute:
             print("obs keys: ", self.obs.keys())
@@ -582,6 +651,8 @@ class OSWorldACI(ACI):
             result = self.code_agent.execute(
                 task_to_execute, screenshot, self.env.controller
             )
+            result["was_full_task"] = self.last_code_agent_was_full_task
+            result["requested_task"] = task
 
             # Store the result for the worker to access
             self.last_code_agent_result = result
@@ -599,6 +670,7 @@ class OSWorldACI(ACI):
             return "import time; time.sleep(2.222)"
         else:
             logger.warning("No task instruction available for code agent call")
+            self.last_code_agent_was_full_task = False
             return "import time; time.sleep(1.111)"
 
     @agent_action

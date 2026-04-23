@@ -100,7 +100,6 @@ class CodeAgent:
         self.agent = None
 
         logger.info(f"CodeAgent initialized with budget={budget}")
-        self.reset()
 
     def reset(self):
         """Reset the code agent state."""
@@ -124,6 +123,8 @@ class CodeAgent:
         logger.info(f"Starting code execution for task: {task_instruction}")
         logger.info(f"Budget: {self.budget} steps")
 
+        if self.agent is None:
+            logger.info("Lazy-initializing CodeAgent LMM engine on first use")
         self.reset()
 
         # Add initial task instruction and screenshot context as user message

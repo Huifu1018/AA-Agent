@@ -16,6 +16,24 @@ class LMMEngine:
     pass
 
 
+def _first_env(*names):
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
+
+
+def _env_int(*names, default=None):
+    value = _first_env(*names)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class LMMEngineOpenAI(LMMEngine):
     def __init__(
         self,
@@ -81,20 +99,41 @@ class LMMEngineAnthropic(LMMEngine):
         assert model is not None, "model must be provided"
         self.model = model
         self.thinking = thinking
+        self.base_url = base_url
         self.api_key = api_key
         self.llm_client = None
         self.temperature = temperature
+        self.default_max_tokens = _env_int("ANTHROPIC_MAX_TOKENS", default=4096)
+        self.thinking_max_tokens = _env_int(
+            "ANTHROPIC_THINKING_MAX_TOKENS", default=8192
+        )
+        self.thinking_budget_tokens = _env_int(
+            "ANTHROPIC_THINKING_BUDGET_TOKENS", default=4096
+        )
+
+    def _get_api_key(self):
+        return self.api_key or os.getenv("ANTHROPIC_API_KEY")
+
+    def _get_base_url(self):
+        return self.base_url or os.getenv("ANTHROPIC_BASE_URL")
+
+    def _get_client(self):
+        client_kwargs = {"api_key": self._get_api_key()}
+        base_url = self._get_base_url()
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        return Anthropic(**client_kwargs)
 
     @backoff.on_exception(
         backoff.expo, (APIConnectionError, APIError, RateLimitError), max_time=60
     )
     def generate(self, messages, temperature=0.0, max_new_tokens=None, **kwargs):
-        api_key = self.api_key or os.getenv("ANTHROPIC_API_KEY")
+        api_key = self._get_api_key()
         if api_key is None:
             raise ValueError(
                 "An API Key needs to be provided in either the api_key parameter or as an environment variable named ANTHROPIC_API_KEY"
             )
-        self.llm_client = Anthropic(api_key=api_key)
+        self.llm_client = self._get_client()
         # Use the instance temperature if not specified in the call
         temp = self.temperature if temperature is None else temperature
         if self.thinking:
@@ -102,8 +141,8 @@ class LMMEngineAnthropic(LMMEngine):
                 system=messages[0]["content"][0]["text"],
                 model=self.model,
                 messages=messages[1:],
-                max_tokens=8192,
-                thinking={"type": "enabled", "budget_tokens": 4096},
+                max_tokens=max_new_tokens if max_new_tokens else self.thinking_max_tokens,
+                thinking={"type": "enabled", "budget_tokens": self.thinking_budget_tokens},
                 **kwargs,
             )
             thoughts = full_response.content[0].thinking
@@ -113,7 +152,7 @@ class LMMEngineAnthropic(LMMEngine):
                 system=messages[0]["content"][0]["text"],
                 model=self.model,
                 messages=messages[1:],
-                max_tokens=max_new_tokens if max_new_tokens else 4096,
+                max_tokens=max_new_tokens if max_new_tokens else self.default_max_tokens,
                 temperature=temp,
                 **kwargs,
             )
@@ -129,18 +168,18 @@ class LMMEngineAnthropic(LMMEngine):
         self, messages, temperature=0.0, max_new_tokens=None, **kwargs
     ):
         """Generate the next message based on previous messages, and keeps the thinking tokens"""
-        api_key = self.api_key or os.getenv("ANTHROPIC_API_KEY")
+        api_key = self._get_api_key()
         if api_key is None:
             raise ValueError(
                 "An API Key needs to be provided in either the api_key parameter or as an environment variable named ANTHROPIC_API_KEY"
             )
-        self.llm_client = Anthropic(api_key=api_key)
+        self.llm_client = self._get_client()
         full_response = self.llm_client.messages.create(
             system=messages[0]["content"][0]["text"],
             model=self.model,
             messages=messages[1:],
-            max_tokens=8192,
-            thinking={"type": "enabled", "budget_tokens": 4096},
+            max_tokens=max_new_tokens if max_new_tokens else self.thinking_max_tokens,
+            thinking={"type": "enabled", "budget_tokens": self.thinking_budget_tokens},
             **kwargs,
         )
 
@@ -150,6 +189,38 @@ class LMMEngineAnthropic(LMMEngine):
             f"<thoughts>\n{thoughts}\n</thoughts>\n\n<answer>\n{answer}\n</answer>\n"
         )
         return full_response
+
+
+class LMMEngineKimi(LMMEngineAnthropic):
+    def __init__(self, model=None, **kwargs):
+        super().__init__(
+            model=model
+            or _first_env(
+                "KIMI_MODEL",
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            ),
+            **kwargs,
+        )
+        self.default_max_tokens = _env_int(
+            "KIMI_MAX_TOKENS", "ANTHROPIC_MAX_TOKENS", default=1024
+        )
+        self.thinking_max_tokens = _env_int(
+            "KIMI_THINKING_MAX_TOKENS",
+            "ANTHROPIC_THINKING_MAX_TOKENS",
+            default=2048,
+        )
+        self.thinking_budget_tokens = _env_int(
+            "KIMI_THINKING_BUDGET_TOKENS",
+            "ANTHROPIC_THINKING_BUDGET_TOKENS",
+            default=1024,
+        )
+
+    def _get_api_key(self):
+        return self.api_key or _first_env("KIMI_API_KEY", "ANTHROPIC_API_KEY")
+
+    def _get_base_url(self):
+        return self.base_url or _first_env("KIMI_BASE_URL", "ANTHROPIC_BASE_URL")
 
 
 class LMMEngineGemini(LMMEngine):

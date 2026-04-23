@@ -161,6 +161,65 @@ agent_s \
     --grounding_height 1080
 ```
 
+#### Kimi K2.5 for Generation + Grounding
+If you are using Moonshot's Anthropic-compatible Kimi endpoint, you can run Agent S3 with Kimi for both the main model and grounding:
+
+```bash
+export KIMI_API_KEY=<YOUR_KIMI_API_KEY>
+export KIMI_BASE_URL=https://api.moonshot.cn/anthropic
+export KIMI_MODEL=kimi-k2.5
+
+agent_s \
+    --provider kimi \
+    --ground_provider kimi \
+    --grounding_width 1920 \
+    --grounding_height 1080
+```
+
+`kimi` also falls back to `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, and `ANTHROPIC_MODEL` if those are already configured.
+
+#### Minimal Web UI for Verification
+If you want a lightweight text box to verify that tasks are being executed through Agent S, you can run the included local web UI:
+
+```bash
+export KIMI_API_KEY=<YOUR_KIMI_API_KEY>
+export KIMI_BASE_URL=https://api.moonshot.cn/anthropic
+export KIMI_MODEL=kimi-k2.5
+
+python tools/agent_s_web_ui.py
+```
+
+Then open [http://127.0.0.1:8787](http://127.0.0.1:8787). The page lets you submit a text task, starts Agent S in the background, and shows the raw execution log so you can verify Agent S actions such as `GROUNDING AGENT: Calling Code Agent` and the final `agent.done()`.
+
+The web UI also runs in a token-saving mode by default for Kimi-based testing:
+- `--max_trajectory_length 3`
+- `KIMI_MAX_TOKENS=1024` unless overridden in the environment
+
+#### Project Skills
+This repo can also store reusable local workflow skills under:
+
+```text
+skills/
+```
+
+Each skill should live in its own subdirectory and include a `SKILL.md`.
+
+Current local skills:
+- `skills/gmail_attachment_reply/SKILL.md`
+  - Gmail watchdog unread-mail handling
+  - latest-body-only extraction
+  - attachment-aware reply generation
+  - reply-all behavior
+  - quote previous email content
+  - direct send instead of draft-only flow
+  - plain-text reply formatting
+  - mark processed messages as read
+
+Use the skill directory name, not just `SKILL.md`, to distinguish workflows. For example:
+- `skills/gmail_attachment_reply/SKILL.md`
+- `skills/wechat_watchdog_reply/SKILL.md`
+- `skills/finder_path_reveal/SKILL.md`
+
 #### Local Coding Environment (Optional)
 For tasks that require code execution (e.g., data processing, file manipulation, system automation), you can enable the local coding environment:
 

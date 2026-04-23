@@ -243,7 +243,27 @@ class MacOSACI(ACI):
         Args:
             app_or_file_name:str, the name of the application or file to open
         """
-        return f"import pyautogui; import time; pyautogui.hotkey('command', 'space', interval=0.5); pyautogui.typewrite({repr(app_or_file_name)}); pyautogui.press('enter'); time.sleep(1.0)"
+        return (
+            "import pathlib; import subprocess; import time; "
+            f"target = {repr(app_or_file_name)}; "
+            "bundle_map = {'WeChat': 'com.tencent.xinWeChat', '微信': 'com.tencent.xinWeChat'}; "
+            "path = pathlib.Path(target).expanduser(); "
+            "opened = False; "
+            "\nif path.exists():\n"
+            "    result = subprocess.run(['open', str(path)], capture_output=True, text=True)\n"
+            "    opened = result.returncode == 0\n"
+            "else:\n"
+            "    bundle_id = bundle_map.get(target)\n"
+            "    if bundle_id:\n"
+            "        result = subprocess.run(['osascript', '-e', f'tell application id \"{bundle_id}\" to activate'], capture_output=True, text=True)\n"
+            "        opened = result.returncode == 0\n"
+            "    if not opened:\n"
+            "        result = subprocess.run(['open', '-a', target], capture_output=True, text=True)\n"
+            "        opened = result.returncode == 0\n"
+            "if not opened:\n"
+            "    raise RuntimeError(f'Unable to open target: {target}')\n"
+            "time.sleep(0.6)"
+        )
 
     @agent_action
     def switch_applications(self, app_or_file_name):
@@ -251,7 +271,22 @@ class MacOSACI(ACI):
         Args:
             app_or_file_name:str, the name of the application or file to switch to
         """
-        return f"import pyautogui; import time; pyautogui.hotkey('command', 'space', interval=0.5); pyautogui.typewrite({repr(app_or_file_name)}); pyautogui.press('enter'); time.sleep(1.0)"
+        return (
+            "import subprocess; import time; "
+            f"app_name = {repr(app_or_file_name)}; "
+            "bundle_map = {'WeChat': 'com.tencent.xinWeChat', '微信': 'com.tencent.xinWeChat'}; "
+            "bundle_id = bundle_map.get(app_name); "
+            "activated = False; "
+            "\nif bundle_id:\n"
+            "    result = subprocess.run(['osascript', '-e', f'tell application id \"{bundle_id}\" to activate'], capture_output=True, text=True)\n"
+            "    activated = result.returncode == 0\n"
+            "if not activated:\n"
+            "    result = subprocess.run(['open', '-a', app_name], capture_output=True, text=True)\n"
+            "    activated = result.returncode == 0\n"
+            "if not activated:\n"
+            "    raise RuntimeError(f'Unable to activate application: {app_name}')\n"
+            "time.sleep(0.6)"
+        )
 
     @agent_action
     def click(
