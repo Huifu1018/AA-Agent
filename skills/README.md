@@ -10,4 +10,4 @@ Suggested convention:
 
 Current skills:
 
-- `gmail_attachment_reply`: Gmail unread-mail handling with latest-body extraction, attachment-aware reasoning, reply-all sending, quoted replies, and mark-as-read behavior
+- `gmail_attachment_reply`: Gmail unread-mail handling with latest-body extraction, Gmail attachment parsing, local material knowledge-base referencing, optional local attachment sending, reply-all sending, hard no-reply rules, quoted replies, and mark-as-read behavior

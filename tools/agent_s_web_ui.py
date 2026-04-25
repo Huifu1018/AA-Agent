@@ -30,6 +30,14 @@ from gui_agents.s3.utils.gmail_watchdog import (
     start_gmail_watchdog,
     stop_gmail_watchdog,
 )
+from gui_agents.s3.utils.telegram_watchdog import (
+    complete_telegram_watchdog_login,
+    get_telegram_watchdog_status,
+    save_telegram_watchdog_config,
+    send_telegram_watchdog_code,
+    start_telegram_watchdog,
+    stop_telegram_watchdog,
+)
 from gui_agents.s3.utils.wechat_watchdog import (
     get_wechat_watchdog_status,
     start_wechat_watchdog,
@@ -87,6 +95,22 @@ class GmailAttachmentDirsRequest(BaseModel):
 
 class GmailAttachmentCatalogPathRequest(BaseModel):
     path: str = ""
+
+
+class TelegramWatchdogRequest(BaseModel):
+    interval_seconds: int = 5
+    log_path: Optional[str] = None
+
+
+class TelegramConfigRequest(BaseModel):
+    api_id: str = ""
+    api_hash: str = ""
+    phone: str = ""
+
+
+class TelegramAuthCompleteRequest(BaseModel):
+    code: str = ""
+    password: str = ""
 
 
 JOBS: Dict[str, Job] = {}
@@ -768,6 +792,64 @@ def _render_index() -> str:
     .watchdog-history-expand[open] summary {{
       margin-bottom: 10px;
     }}
+    .parser-section {{
+      margin-top: 10px;
+      padding: 18px 18px 16px;
+      border-radius: 20px;
+      background: rgba(255, 253, 249, 0.96);
+      border: 1px solid var(--line);
+    }}
+    .parser-section h3 {{
+      margin: 0 0 8px;
+      font-size: 18px;
+    }}
+    .parser-help {{
+      color: #6f7a83;
+      line-height: 1.6;
+      margin-bottom: 12px;
+    }}
+    .parser-textarea {{
+      min-height: 112px;
+      margin-bottom: 12px;
+    }}
+    .parser-status {{
+      margin-top: 10px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: #fff6ea;
+      color: #6b4a1d;
+      white-space: pre-wrap;
+      line-height: 1.6;
+    }}
+    .parser-preview {{
+      margin-top: 12px;
+      display: grid;
+      gap: 10px;
+    }}
+    .parser-preview-item {{
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: #fffdfa;
+      border: 1px solid var(--line);
+    }}
+    .parser-preview-title {{
+      font-weight: 700;
+      margin-bottom: 6px;
+      word-break: break-word;
+    }}
+    .parser-preview-meta {{
+      color: #7d6b57;
+      font-size: 13px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      margin-bottom: 8px;
+    }}
+    .parser-preview-body {{
+      color: #34414a;
+      line-height: 1.7;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }}
   </style>
 </head>
 <body>
@@ -801,6 +883,47 @@ def _render_index() -> str:
           <button id="gmail-watchdog-rescan" class="secondary" type="button" onclick="rescanGmailWatchdog(); return false;">重新扫描当前未读</button>
           <span class="meta" id="gmail-watchdog-meta">尚未巡检</span>
         </div>
+        <div class="watchdog-box" id="telegram-watchdog-box">Telegram watchdog 还没有启动。</div>
+        <div class="watchdog-history" id="telegram-watchdog-history"></div>
+        <div class="parser-section">
+          <h3>Telegram Watchdog</h3>
+          <div class="parser-help">
+            先配置 Telegram API_ID、API_HASH 和手机号，发送验证码并完成登录。第一版只做监听、展示和回复判断，不自动发送消息。
+          </div>
+          <div class="row">
+            <input id="telegram-api-id" placeholder="Telegram API_ID" style="flex:1; min-width:180px;" />
+            <input id="telegram-api-hash" placeholder="Telegram API_HASH" style="flex:1; min-width:220px;" />
+            <input id="telegram-phone" placeholder="手机号（如 +86138xxxx1234）" style="flex:1; min-width:220px;" />
+          </div>
+          <div class="row">
+            <button id="telegram-config-save" class="secondary" type="button" onclick="saveTelegramConfig(); return false;">保存 Telegram 凭证</button>
+            <button id="telegram-send-code" class="secondary" type="button" onclick="sendTelegramCode(); return false;">发送验证码</button>
+            <span class="meta" id="telegram-config-meta">尚未配置</span>
+          </div>
+          <div class="row">
+            <input id="telegram-code" placeholder="验证码" style="flex:1; min-width:120px;" />
+            <input id="telegram-password" placeholder="两步验证密码（如有）" style="flex:1; min-width:220px;" />
+            <button id="telegram-auth-complete" class="secondary" type="button" onclick="completeTelegramLogin(); return false;">完成 Telegram 登录</button>
+          </div>
+          <div class="row">
+            <button id="telegram-watchdog-start" class="secondary" type="button" onclick="startTelegramWatchdog(); return false;">启动 Telegram Watchdog</button>
+            <button id="telegram-watchdog-stop" class="secondary" type="button" onclick="stopTelegramWatchdog(); return false;">停止 Telegram Watchdog</button>
+            <span class="meta" id="telegram-watchdog-meta">尚未巡检</span>
+          </div>
+        </div>
+        <div class="parser-section">
+          <h3>文档目录解析</h3>
+          <div class="parser-help">
+            手动填写要解析的文件夹绝对路径，一行一个。点击解析后，AA-CUA 会读取这些目录下支持的文档内容，并整理到单独的 Markdown 文档里。
+          </div>
+          <textarea id="catalog-dirs" class="parser-textarea" placeholder="例如：&#10;/Users/wangchao/Documents/materials&#10;/Users/wangchao/Desktop/reports"></textarea>
+          <div class="row">
+            <button id="catalog-build-start" class="secondary" type="button" onclick="startDocumentCatalogBuild(); return false;">解析文档目录</button>
+            <span class="meta" id="catalog-build-meta">尚未开始</span>
+          </div>
+          <div class="parser-status" id="catalog-build-status">还没有开始解析。</div>
+          <div class="parser-preview" id="catalog-build-preview"></div>
+        </div>
         <div class="strategy-box" id="strategy-box">任务命中特殊执行策略时，这里会显示本次会采用的流程。</div>
         <div class="info-grid">
           <div class="info-card">
@@ -822,10 +945,14 @@ def _render_index() -> str:
     let pollTimer = null;
     let watchdogTimer = null;
     let gmailWatchdogTimer = null;
+    let telegramWatchdogTimer = null;
     let logAutoFollow = true;
     let notifiedTerminalJobId = "";
     let watchdogBusy = false;
     let gmailWatchdogBusy = false;
+    let telegramWatchdogBusy = false;
+    let telegramConfigBusy = false;
+    let telegramAuthBusy = false;
     let gmailAttachmentDirsBusy = false;
     let gmailAttachmentDirsPickBusy = false;
     let gmailAttachmentCatalogBusy = false;
@@ -1023,10 +1150,102 @@ def _render_index() -> str:
       meta.textContent =
         "最近巡检: " + (status.last_scan_at || "暂无") +
         " | 状态: " + (running ? "running" : "stopped");
+      renderCatalogBuild(status);
     }}
 
-    async function startGmailAttachmentCatalogBuild() {{
-      alert("当前版本未启用附件知识库初始化。");
+    function renderCatalogBuild(status) {{
+      const textarea = document.getElementById("catalog-dirs");
+      const startBtn = document.getElementById("catalog-build-start");
+      const meta = document.getElementById("catalog-build-meta");
+      const box = document.getElementById("catalog-build-status");
+      const preview = document.getElementById("catalog-build-preview");
+      if (!textarea || !startBtn || !meta || !box || !preview) {{
+        return;
+      }}
+      const dirs = Array.isArray(status?.gmail_attachment_dirs) ? status.gmail_attachment_dirs : [];
+      if (!document.activeElement || document.activeElement !== textarea) {{
+        textarea.value = dirs.join("\\n");
+      }}
+      const build = status?.gmail_attachment_catalog_build || {{}};
+      const running = Boolean(build.running);
+      startBtn.disabled = gmailCatalogBuildBusy || running;
+      startBtn.textContent = (gmailCatalogBuildBusy || running) ? "解析中..." : "解析文档目录";
+      meta.textContent = build.ready ? "已完成" : (running ? "解析中" : "尚未开始");
+      const catalogPath = status?.gmail_attachment_catalog_path || build.catalog_path || "暂无";
+      const summary = [
+        "Markdown 输出: " + catalogPath,
+        "总文件数: " + (build.total_files ?? 0),
+        "已处理: " + (build.processed_files ?? 0),
+        "已建立记录: " + (build.indexed_files ?? 0),
+        "跳过: " + (build.skipped_files ?? 0),
+        "当前文件: " + (build.current_file || "暂无"),
+        "最近消息: " + (build.last_message || "暂无"),
+      ];
+      if (build.last_error) {{
+        summary.push("最近错误: " + build.last_error);
+      }}
+      box.textContent = summary.join("\\n");
+      const previewItems = Array.isArray(status?.gmail_attachment_catalog_preview) ? status.gmail_attachment_catalog_preview : [];
+      if (!previewItems.length) {{
+        preview.innerHTML = "";
+        return;
+      }}
+      preview.innerHTML = previewItems.map((item) => {{
+        const title = escapeHtml(item.name || item.declared_name || "未命名文件");
+        const metaText = [
+          "路径: " + escapeHtml(item.path || "暂无"),
+          item.tags ? "标签: " + escapeHtml(item.tags) : "",
+          item.keywords ? "关键词: " + escapeHtml(item.keywords) : "",
+        ].filter(Boolean).join("\\n");
+        return `
+          <div class="parser-preview-item">
+            <div class="parser-preview-title">${{title}}</div>
+            <div class="parser-preview-meta">${{metaText}}</div>
+            <div class="parser-preview-body">${{escapeHtml(item.summary || "暂无摘要")}}</div>
+          </div>
+        `;
+      }}).join("");
+    }}
+
+    async function startDocumentCatalogBuild() {{
+      const textarea = document.getElementById("catalog-dirs");
+      const rawDirs = (textarea?.value || "")
+        .split(/\\r?\\n/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+      if (rawDirs.length === 0) {{
+        alert("请先填写至少一个要解析的文件夹绝对路径。");
+        return;
+      }}
+      gmailCatalogBuildBusy = true;
+      const meta = document.getElementById("catalog-build-meta");
+      if (meta) meta.textContent = "正在保存并启动解析...";
+      const saveResp = await fetch("/api/gmail-watchdog/attachment-dirs", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ directories: rawDirs }})
+      }});
+      const saveData = await saveResp.json();
+      if (!saveResp.ok) {{
+        gmailCatalogBuildBusy = false;
+        alert(saveData.detail || "保存解析目录失败");
+        await refreshGmailWatchdog();
+        return;
+      }}
+      const response = await fetch("/api/gmail-watchdog/catalog-build/start", {{
+        method: "POST"
+      }});
+      const data = await response.json();
+      gmailCatalogBuildBusy = false;
+      if (!response.ok) {{
+        alert(data.detail || "启动文档解析失败");
+        await refreshGmailWatchdog();
+        return;
+      }}
+      renderGmailWatchdog(data);
+      if (!gmailWatchdogTimer) {{
+        gmailWatchdogTimer = setInterval(refreshGmailWatchdog, 5000);
+      }}
     }}
 
     function setGmailAttachmentDirsSaving(saving, message = null) {{
@@ -1064,6 +1283,197 @@ def _render_index() -> str:
         return;
       }}
       renderGmailWatchdog(data);
+    }}
+
+    function renderTelegramWatchdog(status) {{
+      const box = document.getElementById("telegram-watchdog-box");
+      const meta = document.getElementById("telegram-watchdog-meta");
+      const history = document.getElementById("telegram-watchdog-history");
+      const apiIdInput = document.getElementById("telegram-api-id");
+      const apiHashInput = document.getElementById("telegram-api-hash");
+      const phoneInput = document.getElementById("telegram-phone");
+      const configMeta = document.getElementById("telegram-config-meta");
+      const saveBtn = document.getElementById("telegram-config-save");
+      const sendCodeBtn = document.getElementById("telegram-send-code");
+      const authBtn = document.getElementById("telegram-auth-complete");
+      const startBtn = document.getElementById("telegram-watchdog-start");
+      const stopBtn = document.getElementById("telegram-watchdog-stop");
+      if (!status) {{
+        box.textContent = "Telegram watchdog 还没有启动。";
+        meta.textContent = "尚未巡检";
+        history.style.display = "none";
+        history.innerHTML = "";
+        return;
+      }}
+      const config = status.config || {{}};
+      const auth = status.auth || {{}};
+      if (apiIdInput && document.activeElement !== apiIdInput) apiIdInput.value = config.api_id || "";
+      if (apiHashInput && document.activeElement !== apiHashInput) apiHashInput.value = "";
+      if (phoneInput && document.activeElement !== phoneInput) phoneInput.value = config.phone || "";
+      if (configMeta) {{
+        configMeta.textContent =
+          "会话: " + (config.session_exists ? "已登录" : "未登录") +
+          (auth.pending ? " | 验证码已发送" : "") +
+          (telegramConfigBusy ? " | 正在保存..." : "");
+      }}
+      if (saveBtn) saveBtn.disabled = telegramConfigBusy;
+      if (sendCodeBtn) sendCodeBtn.disabled = telegramConfigBusy || telegramAuthBusy || !config.api_id || !config.api_hash_configured || !config.phone;
+      if (authBtn) authBtn.disabled = telegramAuthBusy || !auth.pending;
+      if (startBtn) {{
+        startBtn.disabled = telegramWatchdogBusy || status.running || !config.session_exists;
+        startBtn.textContent = telegramWatchdogBusy && !status.running ? "正在启动..." : "启动 Telegram Watchdog";
+      }}
+      if (stopBtn) {{
+        stopBtn.disabled = telegramWatchdogBusy || !status.running;
+        stopBtn.textContent = telegramWatchdogBusy && status.running ? "正在停止..." : "停止 Telegram Watchdog";
+      }}
+      box.textContent =
+        "Telegram watchdog 状态: " + (status.running ? "运行中" : "未运行") + "\\n" +
+        "最近巡检: " + (status.last_scan_at || "暂无") + "\\n" +
+        "最近命中会话: " + (status.last_chat_name || "暂无") + "\\n" +
+        "最近发送者: " + (status.last_sender_name || "暂无") + "\\n" +
+        "最近消息: " + (status.last_content || "暂无") + "\\n" +
+        "need_reply: " + (status.last_need_reply || "暂无") + "\\n" +
+        "理由: " + (status.last_reply_reason || "暂无") +
+        (status.last_error ? "\\n最近错误: " + status.last_error : "");
+      meta.textContent =
+        "最近巡检: " + (status.last_scan_at || "暂无") +
+        " | 状态: " + (status.running ? "running" : "stopped");
+      const recent = Array.isArray(status.recent_messages) ? status.recent_messages : [];
+      if (!recent.length) {{
+        history.style.display = "none";
+        history.innerHTML = "";
+        return;
+      }}
+      history.style.display = "grid";
+      history.innerHTML = recent.map((item) => {{
+        const title = escapeHtml(item.chat_name || "未命名会话");
+        const metaText =
+          "时间: " + escapeHtml(item.timestamp || "暂无") + "\\n" +
+          "发送者: " + escapeHtml(item.sender_name || "暂无") + "\\n" +
+          "need_reply: " + escapeHtml(item.need_reply || "unknown");
+        const bodyText = item.content || item.media || "暂无内容";
+        const replyDraft = item.draft_reply ? `<div class="watchdog-history-body-preview">建议回复：${{escapeHtml(item.draft_reply)}}</div>` : "";
+        return `
+          <div class="watchdog-history-item">
+            <div class="watchdog-history-title">${{title}}</div>
+            <div class="watchdog-history-meta">${{metaText}}</div>
+            <div class="watchdog-history-body">${{escapeHtml(bodyText)}}</div>
+            ${{replyDraft}}
+          </div>
+        `;
+      }}).join("");
+    }}
+
+    async function refreshTelegramWatchdog() {{
+      const response = await fetch("/api/telegram-watchdog");
+      const data = await response.json();
+      if (!response.ok) {{
+        renderTelegramWatchdog({{
+          running: false,
+          last_error: data.detail || "读取 Telegram watchdog 状态失败"
+        }});
+        return;
+      }}
+      renderTelegramWatchdog(data);
+    }}
+
+    async function saveTelegramConfig() {{
+      telegramConfigBusy = true;
+      const response = await fetch("/api/telegram-watchdog/config", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{
+          api_id: document.getElementById("telegram-api-id").value.trim(),
+          api_hash: document.getElementById("telegram-api-hash").value.trim(),
+          phone: document.getElementById("telegram-phone").value.trim()
+        }})
+      }});
+      const data = await response.json();
+      telegramConfigBusy = false;
+      if (!response.ok) {{
+        alert(data.detail || "保存 Telegram 配置失败");
+        await refreshTelegramWatchdog();
+        return;
+      }}
+      await refreshTelegramWatchdog();
+    }}
+
+    async function sendTelegramCode() {{
+      telegramAuthBusy = true;
+      document.getElementById("telegram-config-meta").textContent = "正在发送 Telegram 验证码...";
+      const response = await fetch("/api/telegram-watchdog/auth/send-code", {{
+        method: "POST"
+      }});
+      const data = await response.json();
+      telegramAuthBusy = false;
+      if (!response.ok) {{
+        alert(data.detail || "发送 Telegram 验证码失败");
+        await refreshTelegramWatchdog();
+        return;
+      }}
+      alert("Telegram 验证码已发送，请在下方填写验证码后完成登录。");
+      await refreshTelegramWatchdog();
+    }}
+
+    async function completeTelegramLogin() {{
+      telegramAuthBusy = true;
+      const response = await fetch("/api/telegram-watchdog/auth/complete", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{
+          code: document.getElementById("telegram-code").value.trim(),
+          password: document.getElementById("telegram-password").value.trim()
+        }})
+      }});
+      const data = await response.json();
+      telegramAuthBusy = false;
+      if (!response.ok) {{
+        alert(data.detail || "完成 Telegram 登录失败");
+        await refreshTelegramWatchdog();
+        return;
+      }}
+      alert("Telegram 登录成功。");
+      document.getElementById("telegram-code").value = "";
+      document.getElementById("telegram-password").value = "";
+      await refreshTelegramWatchdog();
+    }}
+
+    async function startTelegramWatchdog() {{
+      telegramWatchdogBusy = true;
+      document.getElementById("telegram-watchdog-meta").textContent = "正在启动 Telegram watchdog...";
+      const response = await fetch("/api/telegram-watchdog/start", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ interval_seconds: 5 }})
+      }});
+      const data = await response.json();
+      telegramWatchdogBusy = false;
+      if (!response.ok) {{
+        alert(data.detail || "启动 Telegram watchdog 失败");
+        await refreshTelegramWatchdog();
+        return;
+      }}
+      renderTelegramWatchdog(data);
+      if (!telegramWatchdogTimer) {{
+        telegramWatchdogTimer = setInterval(refreshTelegramWatchdog, 5000);
+      }}
+    }}
+
+    async function stopTelegramWatchdog() {{
+      telegramWatchdogBusy = true;
+      document.getElementById("telegram-watchdog-meta").textContent = "正在停止 Telegram watchdog...";
+      const response = await fetch("/api/telegram-watchdog/stop", {{
+        method: "POST"
+      }});
+      const data = await response.json();
+      telegramWatchdogBusy = false;
+      if (!response.ok) {{
+        alert(data.detail || "停止 Telegram watchdog 失败");
+        await refreshTelegramWatchdog();
+        return;
+      }}
+      renderTelegramWatchdog(data);
     }}
 
     async function startGmailOAuth() {{
@@ -1299,11 +1709,18 @@ def _render_index() -> str:
     bindClick("gmail-watchdog-stop", stopGmailWatchdog);
     bindClick("gmail-watchdog-rescan", rescanGmailWatchdog);
     bindClick("gmail-oauth-start", startGmailOAuth);
+    bindClick("telegram-config-save", saveTelegramConfig);
+    bindClick("telegram-send-code", sendTelegramCode);
+    bindClick("telegram-auth-complete", completeTelegramLogin);
+    bindClick("telegram-watchdog-start", startTelegramWatchdog);
+    bindClick("telegram-watchdog-stop", stopTelegramWatchdog);
     setStopButtonState(Boolean(initialActiveJobId), false);
     refreshWatchdog();
     watchdogTimer = setInterval(refreshWatchdog, 5000);
     refreshGmailWatchdog();
     gmailWatchdogTimer = setInterval(refreshGmailWatchdog, 5000);
+    refreshTelegramWatchdog();
+    telegramWatchdogTimer = setInterval(refreshTelegramWatchdog, 5000);
 
     if (initialActiveJobId) {{
       currentJobId = initialActiveJobId;
@@ -1518,6 +1935,53 @@ def gmail_watchdog_oauth_callback(code: str = "", state: str = "", error: str = 
             status_code=400,
         )
     return RedirectResponse(url="/")
+
+
+@APP.get("/api/telegram-watchdog")
+def get_telegram_watchdog() -> dict:
+    return get_telegram_watchdog_status()
+
+
+@APP.post("/api/telegram-watchdog/config")
+def save_telegram_watchdog_config_api(payload: TelegramConfigRequest) -> dict:
+    try:
+        save_telegram_watchdog_config(payload.api_id, payload.api_hash, payload.phone)
+        return get_telegram_watchdog()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@APP.post("/api/telegram-watchdog/auth/send-code")
+def send_telegram_watchdog_code_api() -> dict:
+    try:
+        return send_telegram_watchdog_code()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@APP.post("/api/telegram-watchdog/auth/complete")
+def complete_telegram_watchdog_login_api(payload: TelegramAuthCompleteRequest) -> dict:
+    try:
+        complete_telegram_watchdog_login(payload.code, payload.password)
+        return get_telegram_watchdog()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@APP.post("/api/telegram-watchdog/start")
+def start_telegram_watchdog_api(payload: TelegramWatchdogRequest) -> dict:
+    try:
+        return start_telegram_watchdog(
+            interval_seconds=payload.interval_seconds,
+            log_path=payload.log_path,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@APP.post("/api/telegram-watchdog/stop")
+def stop_telegram_watchdog_api() -> dict:
+    return stop_telegram_watchdog()
 
 
 app = APP

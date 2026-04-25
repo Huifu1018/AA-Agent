@@ -208,6 +208,55 @@ def _save_oauth_state(payload: dict) -> None:
     _write_json(DEFAULT_AUTH_STATE_PATH, payload)
 
 
+def _oauth_states() -> list[dict]:
+    payload = _oauth_state_payload()
+    states = payload.get("states")
+    if isinstance(states, list):
+        return [item for item in states if isinstance(item, dict) and item.get("state")]
+    if payload.get("state"):
+        return [payload]
+    return []
+
+
+def _remember_oauth_state(state: str) -> None:
+    now_ts = int(time.time())
+    existing = _oauth_states()
+    existing.append(
+        {
+            "state": state,
+            "created_at": _now(),
+            "created_at_ts": now_ts,
+        }
+    )
+    deduped: list[dict] = []
+    seen: set[str] = set()
+    for item in sorted(existing, key=lambda value: int(value.get("created_at_ts", 0)), reverse=True):
+        current = str(item.get("state", "")).strip()
+        if not current or current in seen:
+            continue
+        seen.add(current)
+        deduped.append(item)
+        if len(deduped) >= 8:
+            break
+    _save_oauth_state({"states": list(reversed(deduped))})
+
+
+def _consume_oauth_state(state: str, max_age_seconds: int = 1800) -> bool:
+    now_ts = int(time.time())
+    kept: list[dict] = []
+    matched = False
+    for item in _oauth_states():
+        current = str(item.get("state", "")).strip()
+        created_at_ts = int(item.get("created_at_ts", now_ts))
+        if current and now_ts - created_at_ts <= max_age_seconds and current == state and not matched:
+            matched = True
+            continue
+        if current and now_ts - created_at_ts <= max_age_seconds:
+            kept.append(item)
+    _save_oauth_state({"states": kept} if kept else {})
+    return matched
+
+
 def _refresh_access_token(token_info: dict, token_path: Path) -> dict:
     refresh_token = token_info.get("refresh_token")
     client_id = token_info.get("client_id")
@@ -273,24 +322,21 @@ def gmail_oauth_status() -> dict:
 
 
 def gmail_attachment_catalog_status() -> dict:
+    path = _attachment_catalog_path()
     return {
-        "catalog_path": "",
-        "catalog_exists": False,
+        "catalog_path": str(path),
+        "catalog_exists": path.exists(),
     }
 
 
 def gmail_attachment_catalog_preview(limit: int = 12) -> list[dict]:
-    return []
+    return _parse_attachment_catalog()[:limit]
 
 
 def start_gmail_oauth_flow() -> dict:
     client = _load_client_credentials()
     state = secrets.token_urlsafe(24)
-    payload = {
-        "state": state,
-        "created_at": _now(),
-    }
-    _save_oauth_state(payload)
+    _remember_oauth_state(state)
     query = urllib.parse.urlencode(
         {
             "client_id": client["client_id"],
@@ -311,10 +357,9 @@ def start_gmail_oauth_flow() -> dict:
 
 
 def finish_gmail_oauth_flow(code: str, state: str) -> dict:
-    saved = _oauth_state_payload()
     if not code:
         raise RuntimeError("Missing Gmail OAuth code.")
-    if not state or state != saved.get("state"):
+    if not state or not _consume_oauth_state(state):
         raise RuntimeError("Invalid Gmail OAuth state.")
 
     client = _load_client_credentials()
@@ -592,20 +637,39 @@ def _infer_use_cases(file_path: Path, text: str, keywords: list[str]) -> tuple[s
 
 def _build_catalog_entry(file_path: Path, text: str) -> dict:
     cleaned = _clean_text(text)
-    excerpt = cleaned[:220].strip()
-    summary = excerpt or f"文件 {file_path.name} 当前未提取到可用正文，可人工补充摘要。"
-    keywords = _collect_catalog_terms(file_path, cleaned)
-    tags = keywords[:4]
-    use_cases, avoid_cases = _infer_use_cases(file_path, cleaned, keywords)
+    if not cleaned:
+        return {
+            "name": file_path.name,
+            "path": str(file_path),
+            "type": file_path.suffix.lstrip(".").lower() or "unknown",
+            "tags": [],
+            "summary": f"文件 {file_path.name} 当前未提取到可用正文，可人工补充摘要。",
+            "use_cases": "材料补充",
+            "avoid_cases": "未确认内容准确性前不要外发",
+            "keywords": [],
+            "excerpt": "",
+        }
+
+    catalog_summary = _summarize_catalog_entry(file_path, cleaned)
+    keywords = _split_meta_items(catalog_summary.get("keywords", "")) or _collect_catalog_terms(file_path, cleaned)
+    tags = _split_meta_items(catalog_summary.get("tags", ""), limit=6) or keywords[:4]
+    use_cases = catalog_summary.get("use_cases", "").strip()
+    avoid_cases = catalog_summary.get("avoid_cases", "").strip()
+    if not use_cases or not avoid_cases:
+        inferred_use_cases, inferred_avoid_cases = _infer_use_cases(file_path, cleaned, keywords)
+        use_cases = use_cases or inferred_use_cases
+        avoid_cases = avoid_cases or inferred_avoid_cases
+
     return {
         "name": file_path.name,
         "path": str(file_path),
         "type": file_path.suffix.lstrip(".").lower() or "unknown",
         "tags": tags,
-        "summary": summary,
+        "summary": catalog_summary.get("summary", "").strip() or _heuristic_summary(file_path, cleaned),
         "use_cases": use_cases,
         "avoid_cases": avoid_cases,
         "keywords": keywords,
+        "excerpt": catalog_summary.get("excerpt", "").strip() or _truncate_text(cleaned, limit=1200),
     }
 
 
@@ -629,6 +693,11 @@ def _render_attachment_catalog(entries: list[dict]) -> str:
                 f"- 适用场景: {entry['use_cases']}",
                 f"- 禁止场景: {entry['avoid_cases']}",
                 f"- 关键词: {', '.join(entry['keywords']) if entry['keywords'] else '待补充'}",
+                "- 内容摘录:",
+                "",
+                "```",
+                (entry.get("excerpt", "") or "").strip(),
+                "```",
                 "",
             ]
         )
@@ -855,8 +924,22 @@ def _parse_attachment_catalog() -> list[dict]:
         heading = lines[0].strip()
         body_lines = lines[1:]
         fields: dict[str, str] = {}
+        excerpt_lines: list[str] = []
+        collecting_excerpt = False
+        in_fence = False
         for raw_line in body_lines:
             line = raw_line.strip()
+            if collecting_excerpt:
+                if line == "```":
+                    if in_fence:
+                        collecting_excerpt = False
+                        in_fence = False
+                    else:
+                        in_fence = True
+                    continue
+                if in_fence:
+                    excerpt_lines.append(raw_line.rstrip())
+                continue
             if not line.startswith("- "):
                 continue
             payload = line[2:]
@@ -864,6 +947,8 @@ def _parse_attachment_catalog() -> list[dict]:
                 continue
             key, value = payload.split(":", 1)
             fields[key.strip()] = value.strip()
+            if key.strip() == "内容摘录":
+                collecting_excerpt = True
         path_value = fields.get("路径", "").strip()
         if not path_value:
             continue
@@ -884,6 +969,7 @@ def _parse_attachment_catalog() -> list[dict]:
                 "use_cases": fields.get("适用场景", "").strip(),
                 "avoid_cases": fields.get("禁止场景", "").strip(),
                 "keywords": fields.get("关键词", "").strip(),
+                "excerpt": "\n".join(excerpt_lines).strip(),
             }
         )
     return entries
@@ -917,6 +1003,7 @@ def _catalog_attachment_candidates(limit: int = 80) -> list[dict]:
                 "name": path.name,
                 "suffix": path.suffix.lower(),
                 "size": stat.st_size,
+                "mtime_ts": float(stat.st_mtime),
                 "mtime": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
                 "root": next((str(root) for root in roots if _path_within_roots(path, [root])), ""),
                 "summary": entry.get("summary", ""),
@@ -927,7 +1014,7 @@ def _catalog_attachment_candidates(limit: int = 80) -> list[dict]:
                 "source": "catalog",
             }
         )
-    candidates.sort(key=lambda item: (-item["mtime"].replace("-", "").replace(":", "").replace(" ", ""), item["path"]))
+    candidates.sort(key=lambda item: (-float(item.get("mtime_ts", 0.0)), item["path"]))
     return candidates[:limit]
 
 
@@ -956,13 +1043,46 @@ def _heuristic_keywords(text: str, path: Path) -> str:
     return ", ".join(seen)
 
 
+def _split_meta_items(value: str, limit: int = 8) -> list[str]:
+    parts = re.split(r"[,，、;\n]+", value or "")
+    items: list[str] = []
+    for part in parts:
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        if cleaned not in items:
+            items.append(cleaned)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _heuristic_summary(path: Path, cleaned: str) -> str:
+    chunks = [item.strip() for item in re.split(r"[\n。！？!?\r]+", cleaned or "") if item.strip()]
+    selected: list[str] = []
+    for chunk in chunks:
+        if len(chunk) < 12:
+            continue
+        selected.append(chunk)
+        if len(selected) >= 3:
+            break
+    core = "；".join(selected)
+    if not core:
+        core = f"{path.stem} 的资料文件。"
+    summary = (
+        f"该材料主要围绕“{path.stem}”展开，核心内容包括：{core}。"
+        "适合在邮件中用于介绍材料主题、补充背景信息、提供分析结论或作为附件说明发送。"
+    )
+    return _truncate_text(summary, limit=260)
+
+
 def _summarize_catalog_entry(path: Path, text: str) -> dict:
     cleaned = _clean_text(text)
     excerpt = _truncate_text(cleaned, limit=800)
     api_key = os.getenv("KIMI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
     if not api_key or not cleaned:
         return {
-            "summary": excerpt[:180] or f"{path.name} 的本地资料文件。",
+            "summary": _heuristic_summary(path, cleaned),
             "tags": path.suffix.lower().lstrip("."),
             "use_cases": "材料补充",
             "avoid_cases": "",
@@ -976,7 +1096,11 @@ def _summarize_catalog_entry(path: Path, text: str) -> dict:
         "你在为 Gmail 自动回复附件系统生成附件知识库条目。\n"
         "请基于下面文件内容，输出 JSON："
         '{"summary":"一句中文摘要","tags":"逗号分隔标签","use_cases":"逗号分隔适用场景","avoid_cases":"逗号分隔禁止场景","keywords":"逗号分隔关键词"}\n'
-        "要求：摘要要说明文件适合什么邮件场景，字段尽量简短。\n\n"
+        "要求：\n"
+        "1. summary 用 2-4 句中文完整介绍材料内容，不少于 80 字，尽量说明主题、核心内容、适用场景；\n"
+        "2. 不要只截取开头文本，不要直接输出 OCR 噪声；\n"
+        "3. tags / use_cases / avoid_cases / keywords 保持简短，使用逗号分隔；\n"
+        "4. 输出必须是严格 JSON，不要添加解释。\n\n"
         f"文件名：{path.name}\n"
         f"文件内容：{_truncate_text(cleaned, limit=3500)}"
     )
@@ -991,7 +1115,7 @@ def _summarize_catalog_entry(path: Path, text: str) -> dict:
         if match:
             payload = json.loads(match.group(0))
             return {
-                "summary": str(payload.get("summary", "")).strip() or excerpt[:180] or f"{path.name} 的本地资料文件。",
+                "summary": str(payload.get("summary", "")).strip() or _heuristic_summary(path, cleaned),
                 "tags": str(payload.get("tags", "")).strip(),
                 "use_cases": str(payload.get("use_cases", "")).strip(),
                 "avoid_cases": str(payload.get("avoid_cases", "")).strip(),
@@ -1001,7 +1125,7 @@ def _summarize_catalog_entry(path: Path, text: str) -> dict:
     except Exception:
         pass
     return {
-        "summary": excerpt[:180] or f"{path.name} 的本地资料文件。",
+        "summary": _heuristic_summary(path, cleaned),
         "tags": path.suffix.lower().lstrip("."),
         "use_cases": "材料补充",
         "avoid_cases": "",
@@ -1163,11 +1287,12 @@ def _list_local_attachment_candidates(limit: int = 80) -> list[dict]:
                     "name": path.name,
                     "suffix": path.suffix.lower(),
                     "size": stat.st_size,
+                    "mtime_ts": float(stat.st_mtime),
                     "mtime": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
                     "root": str(root),
                 }
             )
-    candidates.sort(key=lambda item: (-item["mtime"].replace("-", "").replace(":", "").replace(" ", ""), item["path"]))
+    candidates.sort(key=lambda item: (-float(item.get("mtime_ts", 0.0)), item["path"]))
     return candidates[:limit]
 
 
@@ -1178,10 +1303,20 @@ def _select_local_reply_attachments(
     candidate_files: list[dict],
 ) -> dict:
     if not candidate_files:
-        return {"should_attach": False, "reason": "No configured local attachment directories.", "selected_paths": []}
+        return {
+            "use_catalog": False,
+            "should_attach": False,
+            "reason": "No configured local attachment directories.",
+            "selected_paths": [],
+        }
     api_key = os.getenv("KIMI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
-        return {"should_attach": False, "reason": "No Kimi/Anthropic API key available for attachment selection.", "selected_paths": []}
+        return {
+            "use_catalog": False,
+            "should_attach": False,
+            "reason": "No Kimi/Anthropic API key available for attachment selection.",
+            "selected_paths": [],
+        }
     model = os.getenv("KIMI_MODEL", os.getenv("ANTHROPIC_MODEL", "kimi-k2.5"))
     base_url = os.getenv("KIMI_BASE_URL", os.getenv("ANTHROPIC_BASE_URL", "https://api.moonshot.cn/anthropic"))
     client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
@@ -1203,6 +1338,8 @@ def _select_local_reply_attachments(
             details.append(f"适用场景={item['use_cases']}")
         if item.get("avoid_cases"):
             details.append(f"禁止场景={item['avoid_cases']}")
+        if item.get("excerpt"):
+            details.append(f"内容摘录={_truncate_text(str(item['excerpt']), limit=220)}")
         file_lines.append(
             " | ".join(details)
         )
@@ -1214,9 +1351,12 @@ def _select_local_reply_attachments(
     )
     prompt = (
         "你在做 Gmail 自动回复的本地附件选择。\n"
-        "请判断这封邮件是否明确要求我们从本地文件夹附上资料、文档、图片、PPT、PDF 或其他文件。\n"
-        "只有在邮件明确索要本地材料、方案、PPT、文档、报告、图片、附件时，才允许选择文件。\n"
-        "如果不确定，就不要选。\n\n"
+        "请判断是否需要参考本地资料知识库中的文档内容来帮助回复，以及是否需要把这些文件作为附件一起发出去。\n"
+        "规则：\n"
+        "1. 如果邮件问题明显涉及本地资料目录里的材料内容、报告结论、案例说明、分析结果、PPT/文档内容，请选出相关文件作为知识库参考。\n"
+        "2. 只有在邮件明确索要本地材料、方案、PPT、文档、报告、图片、附件时，才允许 should_attach=true。\n"
+        "3. 如果只是需要借助本地资料内容来回答，但对方没有明确要附件，可以 use_catalog=true 且 should_attach=false。\n"
+        "4. 如果不确定，就不要选。\n\n"
         f"发件人：{sender}\n"
         f"主题：{subject}\n"
         f"邮件内容：{content}\n\n"
@@ -1224,11 +1364,11 @@ def _select_local_reply_attachments(
         "可选本地文件如下：\n"
         + "\n".join(file_lines)
         + "\n\n请只输出 JSON，格式如下：\n"
-        '{"should_attach": true/false, "reason": "中文理由", "selected_paths": ["绝对路径1", "绝对路径2"]}\n'
+        '{"use_catalog": true/false, "should_attach": true/false, "reason": "中文理由", "selected_paths": ["绝对路径1", "绝对路径2"]}\n'
         "要求：\n"
         "1. 最多选择 3 个文件。\n"
         "2. 只能从给定列表里选。\n"
-        "3. 如果邮件只是讨论、确认、询问，不要附加文件。\n"
+        "3. 如果邮件只是讨论、确认、询问，但问题涉及目录下材料内容，可以 use_catalog=true。\n"
         "4. 只有高置信度时才返回 should_attach=true。"
     )
     response = client.messages.create(
@@ -1239,11 +1379,21 @@ def _select_local_reply_attachments(
     text = "\n".join(getattr(block, "text", "") for block in response.content).strip()
     match = re.search(r"\{.*\}", text, re.S)
     if not match:
-        return {"should_attach": False, "reason": "Attachment selector returned non-JSON output.", "selected_paths": []}
+        return {
+            "use_catalog": False,
+            "should_attach": False,
+            "reason": "Attachment selector returned non-JSON output.",
+            "selected_paths": [],
+        }
     try:
         payload = json.loads(match.group(0))
     except Exception:
-        return {"should_attach": False, "reason": "Attachment selector returned invalid JSON.", "selected_paths": []}
+        return {
+            "use_catalog": False,
+            "should_attach": False,
+            "reason": "Attachment selector returned invalid JSON.",
+            "selected_paths": [],
+        }
     selected_paths = []
     allowed_paths = {item["path"] for item in candidate_files}
     for value in payload.get("selected_paths", []) or []:
@@ -1251,10 +1401,35 @@ def _select_local_reply_attachments(
         if normalized in allowed_paths and normalized not in selected_paths:
             selected_paths.append(normalized)
     return {
+        "use_catalog": bool(payload.get("use_catalog")) and bool(selected_paths),
         "should_attach": bool(payload.get("should_attach")) and bool(selected_paths),
         "reason": str(payload.get("reason", "")).strip(),
         "selected_paths": selected_paths[:3],
     }
+
+
+def _format_catalog_reference_context(candidate_files: list[dict], selected_paths: list[str]) -> str:
+    if not selected_paths:
+        return ""
+    items_by_path = {str(item.get("path", "")).strip(): item for item in candidate_files}
+    sections: list[str] = []
+    for idx, path_value in enumerate(selected_paths, start=1):
+        item = items_by_path.get(path_value)
+        if not item:
+            continue
+        sections.extend(
+            [
+                f"[资料 {idx}] 文件名：{item.get('name', '')}",
+                f"路径：{item.get('path', '')}",
+                f"摘要：{item.get('summary', '')}",
+                f"标签：{item.get('tags', '')}",
+                f"适用场景：{item.get('use_cases', '')}",
+                f"关键词：{item.get('keywords', '')}",
+                f"内容摘录：{_truncate_text(str(item.get('excerpt', '')), limit=1200)}",
+                "",
+            ]
+        )
+    return "\n".join(sections).strip()
 
 
 def _attach_local_files_to_message(mime: EmailMessage, attachments: list[Path]) -> None:
@@ -1439,6 +1614,15 @@ def _recent_entries(log_path: Path, limit: int = 5) -> list[dict]:
         if len(entries) >= limit:
             break
     return entries
+
+
+def _is_no_reply_message(email_data: dict) -> bool:
+    subject = str(email_data.get("subject", "")).strip()
+    sender = str(email_data.get("from", "")).strip()
+    thread_markers = [
+        "[Yuan-lab-LLM/ClawManager]",
+    ]
+    return any(marker in subject or marker in sender for marker in thread_markers)
 
 
 def _safe_fetch_current_unread_entries(limit: int = 5) -> list[dict]:
@@ -1963,12 +2147,55 @@ class GmailWatchdog:
                     if not message_id or message_id in self._seen_ids:
                         continue
                     email_data = self._fetch_message_detail(message_id)
+                    if _is_no_reply_message(email_data):
+                        assessment = {
+                            "need_reply": "no",
+                            "reason": "命中不回复规则：来自 [Yuan-lab-LLM/ClawManager] 的邮件不自动回复。",
+                            "draft_reply": "",
+                            "local_attachment_reason": "",
+                            "local_attachment_paths": [],
+                            "local_attachment_source": "",
+                        }
+                        try:
+                            mark_gmail_message_read(message_id)
+                            assessment["marked_read"] = True
+                        except Exception as mark_exc:
+                            assessment["mark_read_error"] = str(mark_exc)
+                        self._seen_ids[message_id] = email_data.get("threadId", "") or "seen"
+                        self._save_state()
+                        self._record_detection(email_data, assessment)
+                        continue
                     content_for_assessment = (email_data.get("body", "") or email_data.get("snippet", "")).strip()
                     attachment_context = (email_data.get("attachment_context") or "").strip()
                     if attachment_context:
                         content_for_assessment = (
                             f"{content_for_assessment}\n\n附件内容如下：\n{attachment_context}"
                         ).strip()
+                    candidate_files = _catalog_attachment_candidates(limit=80)
+                    if not candidate_files:
+                        candidate_files = _list_local_attachment_candidates(limit=80)
+                    material_plan = {
+                        "use_catalog": False,
+                        "should_attach": False,
+                        "reason": "",
+                        "selected_paths": [],
+                    }
+                    try:
+                        material_plan = _select_local_reply_attachments(
+                            email_data.get("from", ""),
+                            email_data.get("subject", ""),
+                            content_for_assessment,
+                            candidate_files,
+                        )
+                    except Exception as material_exc:
+                        material_plan["reason"] = f"本地资料匹配失败：{material_exc}"
+                    selected_paths = list(material_plan.get("selected_paths") or [])
+                    if material_plan.get("use_catalog") and selected_paths:
+                        catalog_context = _format_catalog_reference_context(candidate_files, selected_paths)
+                        if catalog_context:
+                            content_for_assessment = (
+                                f"{content_for_assessment}\n\n【本地资料知识库相关文档】\n{catalog_context}"
+                            ).strip()
                     assessment = self._assess_reply_need(
                         email_data.get("from", ""),
                         email_data.get("subject", ""),
@@ -1990,15 +2217,22 @@ class GmailWatchdog:
                     assessment["local_attachment_reason"] = ""
                     assessment["local_attachment_paths"] = []
                     assessment["local_attachment_source"] = ""
+                    if material_plan.get("reason"):
+                        assessment["local_attachment_reason"] = material_plan.get("reason", "")
+                    if material_plan.get("use_catalog") and selected_paths:
+                        assessment["local_attachment_source"] = "catalog"
+                    if material_plan.get("should_attach") and selected_paths:
+                        assessment["local_attachment_paths"] = selected_paths
                     if assessment.get("need_reply") == "yes" and (assessment.get("draft_reply") or "").strip():
                         try:
                             sent = send_gmail_reply(
                                 email_data.get("subject", ""),
                                 (assessment.get("draft_reply") or "").strip(),
-                                local_attachment_paths=[],
+                                local_attachment_paths=list(assessment.get("local_attachment_paths") or []),
                             )
                             assessment["sent_reply_id"] = sent.get("message_id", "")
                             assessment["sent_reply_subject"] = sent.get("subject", "")
+                            assessment["local_attachment_paths"] = sent.get("local_attachment_paths", assessment.get("local_attachment_paths") or [])
                         except Exception as send_exc:
                             assessment["sent_reply_error"] = str(send_exc)
                     try:
@@ -2037,36 +2271,8 @@ def reset_gmail_watchdog_seen() -> dict:
 
 
 def start_gmail_attachment_catalog_build() -> dict:
-    return {
-        "running": False,
-        "ready": False,
-        "catalog_path": "",
-        "configured_dirs": [],
-        "total_files": 0,
-        "processed_files": 0,
-        "indexed_files": 0,
-        "skipped_files": 0,
-        "current_file": "",
-        "last_started_at": "",
-        "last_finished_at": "",
-        "last_error": "",
-        "last_message": "此版本未启用附件知识库初始化。",
-    }
+    return CATALOG_BUILDER.start()
 
 
 def get_gmail_attachment_catalog_build_status() -> dict:
-    return {
-        "running": False,
-        "ready": False,
-        "catalog_path": "",
-        "configured_dirs": [],
-        "total_files": 0,
-        "processed_files": 0,
-        "indexed_files": 0,
-        "skipped_files": 0,
-        "current_file": "",
-        "last_started_at": "",
-        "last_finished_at": "",
-        "last_error": "",
-        "last_message": "此版本未启用附件知识库初始化。",
-    }
+    return CATALOG_BUILDER.status()
